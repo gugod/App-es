@@ -11,7 +11,7 @@ use Term::ANSIColor;
 use URI;
 use URI::Split qw(uri_split);
 
-use ElasticSearch;
+use Elastijk;
 
 use Moo;
 use MooX::Options protect_argv => 0;
@@ -105,11 +105,10 @@ option type => (
 );
 
 sub _build_es {
-    return ElasticSearch->new(
-        servers     => $ENV{ELASTIC_SEARCH_SERVERS},
-        trace_calls => $ENV{ELASTIC_SEARCH_TRACE},
-        transport   => $ENV{ELASTIC_SEARCH_TRANSPORT} || ($^V gt v5.14.0 ? "httptiny" : "http"),
-        timeout     => $ENV{ELASTIC_SEARCH_TIMEOUT} || "10", # seconds
+    my ($host, $port) = split(/:/, ($ENV{ELASTIC_SEARCH_SERVERS} // "localhost:9200"));
+    return Elastijk->new(
+        host => $host,
+        port => $port,
     );
 }
 
@@ -150,38 +149,21 @@ sub command_ls {
     my ($self, $str) = @_;
 
     my $es = $self->es;
-
-    my $aliases = $es->get_aliases;
-
-    my @indices = $ElasticSearch::VERSION < 0.52
-        ? keys %{ $aliases->{indices} }
-        : keys %{ $aliases };
+    my $res = $es->get( command => "_aliases" );
+    my @indices = keys %$res;
 
     if ($self->long) {
-        my $stats;
-        eval {
-            $stats = $es->index_stats(
-                index => \@indices,
-                docs  => 1,
-                store => 1,
-            );
-            1;
-        } or do {
-            die "[ERROR] failed to obtain stats for index: $str\n";
-        };
+        $res = $es->get( command => "_stats" );
+        INDEX: for my $i ( sort keys %{ $res->{indices} } ) {
+            next INDEX if $str and $i !~ /$str/;
 
+            my $size  = $res->{indices}{$i}{primaries}{store}{size_in_bytes};
+            my $count = $res->{indices}{$i}{primaries}{docs}{count};
 
-    INDEX: for my $i ( sort keys %{ $stats->{_all}{indices} } ) {
-          next INDEX if $str and $i !~ /$str/;
-
-          my $size  = $stats->{_all}{indices}{$i}{primaries}{store}{size};
-          my $count = $stats->{_all}{indices}{$i}{primaries}{docs}{count};
-
-          printf "%s\t%s\t%s\n", $size, $count, $i;
-      }
-    }
-    else {
-      INDEX: for ( sort @indices ) {
+            printf "%s\t%s\t%s\n", $size, $count, $i;
+        }
+    } else {
+        INDEX: for ( sort @indices ) {
             next INDEX if $str and !/$str/;
             print "$_\n";
         }
@@ -501,42 +483,23 @@ sub _es_from_url {
 }
 sub _get_elastic_search_aliases {
     my ($self) = @_;
-
-    my @aliases;
-    my $aliases = $self->es->get_aliases;
-
-    if ($ElasticSearch::VERSION < 0.52) {
-        @aliases = keys %{$aliases->{aliases}};
+    my $res = $self->es->get( command => "_aliases" );
+    my %uniq_aliases;
+    for my $i (keys %$res) {
+        $uniq_aliases{$_} = 1 for keys %{$res->{$i}{aliases}};
     }
-    else {
-        my %uniq_aliases;
-        for my $i (keys %$aliases) {
-            $uniq_aliases{$_} = 1 for keys %{$aliases->{$i}{aliases}};
-        }
-        @aliases = keys %uniq_aliases;
-    }
-
+    my @aliases = keys %uniq_aliases;
     return \@aliases;
 }
 
 sub _get_elastic_search_index_alias_mapping {
     my ($self) = @_;
-    my $aliases = $self->es->get_aliases;
     my %mapping;
-
-    if ($ElasticSearch::VERSION < 0.52) {
-        for (keys %{$aliases->{indices}}) {
-            push @{ $mapping{$_} ||=[] }, @{ $aliases->{indices}{$_} };
-        }
-        for (keys %{$aliases->{aliases}}) {
-            push @{ $mapping{$_} ||=[] }, @{ $aliases->{aliases}{$_} };
-        }
-    }
-    else {
-        for my $i (keys %$aliases) {
-            for my $a (@{ $mapping{$i} = [keys %{$aliases->{$i}{aliases}}] }) {
-                push @{$mapping{$a} ||=[]}, $i;
-            }
+    my $res = $self->es->get( command => "_aliases" );
+    for my $idx (keys %$res) {
+        for my $alias (keys %{$res->{$idx}}) {
+            push @{$mapping{$alias}}, $idx;
+            push @{$mapping{$idx}}, $alias;
         }
     }
     return \%mapping;
